@@ -12,7 +12,8 @@ import bs4
 
 
 BASE_URL = "https://sofifa.com"
-LEAGUE_NUMBER = 13
+LEAGUE_NUMBER = "13"  # EPL
+WEEK_NUMBER = "01"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 FIELDS = [
@@ -219,10 +220,12 @@ class Team:
 
 
 class Season:
-    def __init__(self, season: str):
+    def __init__(
+        self, season: str, week: str = WEEK_NUMBER, league: str = LEAGUE_NUMBER
+    ):
         self._season: str = season
-        self._week: str = 1
-        self._league: str = 13
+        self._week: str = week
+        self._league: str = league
         self._teams: Dict[str, Team] = self._get_teams()
 
     @property
