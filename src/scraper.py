@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from time import sleep
 from functools import cache
 from typing import TypedDict, Dict, Tuple, List
@@ -27,7 +28,7 @@ def extract_team_from_href(href: str) -> str:
     match = re.search(pattern, href)
 
     if not match:
-        raise ValueError(f"Could not find the team identifier for tag: {href}")
+        raise ValueError(f"could not find the team identifier for tag: {href}")
 
     return str(match.group(1))
 
@@ -54,7 +55,7 @@ class Player:
         return column.has_attr("title") and column.string is not None
 
     def _extract_data(self, record: bs4.element.tag) -> Tuple[str, str]:
-        return record.get("title"), record.string
+        return record.get("title").lower(), record.string
 
     def _extract_team(self, records: bs4.ResultSet) -> Team:
         try:
@@ -98,7 +99,7 @@ class Team:
         self._name = name
         self._identifier = identifier
 
-    def _extract_player_mapping(self, raw_player_data: List[str]) -> Tuple[str, str]:
+    def _extract_player_mapping(self, raw_player_data: List[str]) -> Tuple[str, Player]:
         PLAYER_NAME_INDEX = 3
         LINK_INDEX = 1
         extraction = list(list(raw_player_data)[PLAYER_NAME_INDEX])[1]
@@ -114,7 +115,7 @@ class Team:
         return extraction.string, Player(extraction.string, player_number)
 
     @cache
-    def players(self, season: str) -> List[Player]:
+    def players(self, season: str) -> Dict[str, Player]:
         url = f"{BASE_URL}/players?tm={self._identifier}"
         soup = get_bs4(url)
         players = list(soup.find_all("tr"))
@@ -122,8 +123,11 @@ class Team:
             self._extract_player_mapping(players[i]) for i in range(2, len(players))
         )
 
+    def __str__(self) -> str:
+        return self._identifier
 
-class SeasonScraper:
+
+class Season:
     def __init__(self, season: str):
         self._season: str = season
         self._week: str = 1
@@ -160,9 +164,19 @@ class SeasonScraper:
         return f"{BASE_URL}/?r={self.season_query}&set=true"
 
 
+fields = ['season', 'player', 'team', 'appearances', 'lineups', 'substitute in', 'substitute out', 'subs on bench', 'injuries', 'minutes played', 'goals', 'assists', 'big chances created', 'big chances missed', 'shots', 'on target', 'shots blocked', 'hit woodwork', 'passes', 'accurate passes', 'key passes', 'crosses', 'crosses accurate', 'long balls', 'through balls', 'passing accuracy', 'dribbles attempts', 'dribbles success', 'dribbled past', 'dribbles dispossessed', 'duels', 'duels won', 'tackles', 'interceptions', 'blocks', 'long balls won', 'aerials won', 'clearances', 'fouls committed', 'fouls drawn', 'yellow cards', '2nd yellow card', 'red cards', 'offsides', 'saves', 'inside box saves', 'penalty saved', 'clean sheets', 'conceded', 'rating']
+
 if __name__ == "__main__":
-    season_scraper = SeasonScraper(23)
-    teams = list(season_scraper.teams.values())
-    players = list(teams[0].players("23").values())
-    print(players)
-    print(players[0].statistics("23"))
+    season = Season("23")
+    with open("2023.csv", 'w') as season_file:
+        season_writer = csv.DictWriter(season_file, delimiter=",", fieldnames=fields) 
+        for team in season.teams.values():
+            for player in team.players("23").values():
+                try:
+                    record = player.statistics("23")
+                except KeyError:
+                    print("Unable to retrieve 23 for: ", player)
+                else:
+                    season_writer.writerow(record)
+
+
