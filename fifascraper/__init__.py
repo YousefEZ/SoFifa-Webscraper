@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import csv
 from time import sleep
-from functools import cache
+from functools import cached_property, cache
 from typing import TypedDict, Dict, Tuple, List
 import sys
 import re
@@ -15,6 +14,59 @@ import bs4
 BASE_URL = "https://sofifa.com"
 LEAGUE_NUMBER = 13
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+FIELDS = [
+    "season",
+    "player",
+    "team",
+    "appearances",
+    "lineups",
+    "substitute in",
+    "substitute out",
+    "subs on bench",
+    "injuries",
+    "minutes played",
+    "goals",
+    "assists",
+    "big chances created",
+    "big chances missed",
+    "shots",
+    "on target",
+    "shots blocked",
+    "hit woodwork",
+    "passes",
+    "accurate passes",
+    "key passes",
+    "crosses",
+    "crosses accurate",
+    "long balls",
+    "through balls",
+    "passing accuracy",
+    "dribbles attempts",
+    "dribbles success",
+    "dribbled past",
+    "dribbles dispossessed",
+    "duels",
+    "duels won",
+    "tackles",
+    "interceptions",
+    "blocks",
+    "long balls won",
+    "aerials won",
+    "clearances",
+    "fouls committed",
+    "fouls drawn",
+    "yellow cards",
+    "2nd yellow card",
+    "red cards",
+    "offsides",
+    "saves",
+    "inside box saves",
+    "penalty saved",
+    "clean sheets",
+    "conceded",
+    "rating",
+]
 
 
 def get_bs4(url: str) -> bs4.BeautifulSoup:
@@ -33,6 +85,24 @@ def extract_team_from_href(href: str) -> str:
     return str(match.group(1))
 
 
+def retry_from_header(func):
+    DEFAULT_RETRY = 15  # seconds
+
+    def decorator(*args, **kwargs):
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except urllib.error.HTTPError as e:
+                if (
+                    e.code != 429
+                ):  # Check if the error is due to rate limiting (HTTP 429 Too Many Requests)
+                    raise e
+                retry_after = e.headers.get("Retry-After")
+                sleep(float(retry_after) if retry_after else DEFAULT_RETRY)
+
+    return decorator
+
+
 class SeasonRecord(TypedDict, total=False):
     season: str
     player: Player
@@ -43,19 +113,32 @@ class Player:
     def __init__(self, name: str, identifier: str):
         self._name = name
         self._identifier = identifier
-        self._seasons = self._get_all_statistics()
 
-    def _get_all_statistics(self) -> Dict[str, SeasonRecord]:
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @cache
+    @retry_from_header
+    def statistics(self) -> Dict[str, SeasonRecord]:
         url = f"{BASE_URL}/player/{self._identifier}/live&set=true"
         soup = get_bs4(url)
-        seasons = list(soup.find("table").find_all("tr"))
+        table = soup.find("table")
+        if not table:
+            # this is the case if the player is new, example: https://sofifa.com/player/268550/joshua-feeney/live
+            return dict()
+        seasons = list(table.find_all("tr"))
         return dict(self._create_record(seasons[i]) for i in range(2, len(seasons)))
 
     def _has_title(self, column: bs4.element.tag) -> bool:
         return column.has_attr("title") and column.string is not None
 
     def _extract_data(self, record: bs4.element.tag) -> Tuple[str, str]:
-        return record.get("title").lower(), record.string
+        # some data starts with "-" but is followed by weird characters, so normalising
+        return (
+            record.get("title").lower(),
+            "-" if record.string[0] == "-" else record.string,
+        )
 
     def _extract_team(self, records: bs4.ResultSet) -> Team:
         try:
@@ -66,12 +149,12 @@ class Player:
 
     def _extract_season(self, records: bs4.ResultSet) -> str:
         raw_season = records[0].string
-        match = re.match(r'\d{4}/(\d{4})|\d{4}', raw_season)
-    
+        match = re.match(r"\d{4}/(\d{4})|\d{4}", raw_season)
+
         if match:
             season = match.group(1) if match.group(1) else match.group(0)
             return season[2:]
-        raise ValueError("Season Number not detected")        
+        raise ValueError("Season Number not detected")
 
     def _create_record(self, season_data: bs4.element.tag) -> Tuple[str, SeasonRecord]:
         records = season_data.find_all("td")
@@ -87,11 +170,18 @@ class Player:
         )
         return record["season"], record
 
-    def statistics(self, season: str) -> SeasonRecord:
-        return self._seasons[season]
+    @cache
+    def season_record(self, season: str) -> SeasonRecord:
+        return self.statistics()[season]
 
     def __str__(self) -> str:
         return str(self._identifier)
+
+    def __eq__(self, other: Player) -> bool:
+        return other._identifier == self._identifier
+
+    def __hash__(self) -> int:
+        return hash(self._identifier)
 
 
 class Team:
@@ -115,6 +205,7 @@ class Team:
         return extraction.string, Player(extraction.string, player_number)
 
     @cache
+    @retry_from_header
     def players(self, season: str) -> Dict[str, Player]:
         url = f"{BASE_URL}/players?tm={self._identifier}"
         soup = get_bs4(url)
@@ -124,7 +215,7 @@ class Team:
         )
 
     def __str__(self) -> str:
-        return self._identifier
+        return str(self._name).strip()
 
 
 class Season:
@@ -150,6 +241,7 @@ class Season:
             extraction.string, extract_team_from_href(extraction.get("href"))
         )
 
+    @retry_from_header
     def _get_teams(self) -> Dict[str, Team]:
         url = f"{BASE_URL}/teams?type=all&lg={LEAGUE_NUMBER}&r={self._season}00{self._week}&set=true"
         soup = get_bs4(url)
@@ -162,21 +254,3 @@ class Season:
 
     def create_url(self) -> str:
         return f"{BASE_URL}/?r={self.season_query}&set=true"
-
-
-fields = ['season', 'player', 'team', 'appearances', 'lineups', 'substitute in', 'substitute out', 'subs on bench', 'injuries', 'minutes played', 'goals', 'assists', 'big chances created', 'big chances missed', 'shots', 'on target', 'shots blocked', 'hit woodwork', 'passes', 'accurate passes', 'key passes', 'crosses', 'crosses accurate', 'long balls', 'through balls', 'passing accuracy', 'dribbles attempts', 'dribbles success', 'dribbled past', 'dribbles dispossessed', 'duels', 'duels won', 'tackles', 'interceptions', 'blocks', 'long balls won', 'aerials won', 'clearances', 'fouls committed', 'fouls drawn', 'yellow cards', '2nd yellow card', 'red cards', 'offsides', 'saves', 'inside box saves', 'penalty saved', 'clean sheets', 'conceded', 'rating']
-
-if __name__ == "__main__":
-    season = Season("23")
-    with open("2023.csv", 'w') as season_file:
-        season_writer = csv.DictWriter(season_file, delimiter=",", fieldnames=fields) 
-        for team in season.teams.values():
-            for player in team.players("23").values():
-                try:
-                    record = player.statistics("23")
-                except KeyError:
-                    print("Unable to retrieve 23 for: ", player)
-                else:
-                    season_writer.writerow(record)
-
-
