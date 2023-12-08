@@ -15,10 +15,21 @@ BASE_URL = "https://sofifa.com"
 LEAGUE_NUMBER = 13
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+
 def get_bs4(url: str) -> bs4.BeautifulSoup:
     page_req = urllib.request.Request(url, headers=HEADERS)
     page = urllib.request.urlopen(page_req)
     return bs4.BeautifulSoup(page, "html.parser")
+
+
+def extract_team_from_href(href: str) -> str:
+    pattern = r"/team/(\d+)/\S+/"
+    match = re.search(pattern, href)
+
+    if not match:
+        raise ValueError(f"Could not find the team identifier for tag: {href}")
+
+    return str(match.group(1))
 
 
 class SeasonRecord(TypedDict, total=False):
@@ -28,40 +39,66 @@ class SeasonRecord(TypedDict, total=False):
 
 
 class Player:
-	
-    def __init__(self, name: str, number: int):
+    def __init__(self, name: str, identifier: str):
         self._name = name
-        self._number = number
+        self._identifier = identifier
         self._seasons = self._get_all_statistics()
 
     def _get_all_statistics(self) -> Dict[str, SeasonRecord]:
-        url = f"{BASE_URL}/player/{self._number}/live&set=true"
+        url = f"{BASE_URL}/player/{self._identifier}/live&set=true"
         soup = get_bs4(url)
         seasons = list(soup.find("table").find_all("tr"))
-        return dict(self._create_record("23", seasons[i]) for i in range(2, len(seasons)))
+        return dict(self._create_record(seasons[i]) for i in range(2, len(seasons)))
 
     def _has_title(self, column: bs4.element.tag) -> bool:
         return column.has_attr("title") and column.string is not None
 
     def _extract_data(self, record: bs4.element.tag) -> Tuple[str, str]:
-        return record.get("title"), record.string 
+        return record.get("title"), record.string
 
-    def _create_record(self, season: str, season_data: bs4.element.tag) -> Tuple[str, SeasonRecord]:
+    def _extract_team(self, records: bs4.ResultSet) -> Team:
+        try:
+            team_number = extract_team_from_href(records[1].find("a").get("href"))
+        except ValueError:
+            team_number = "-"  # some teams don't have identifiers, in this case filling it with "-"
+        return Team(records[1].get("title").strip(), team_number)
+
+    def _extract_season(self, records: bs4.ResultSet) -> str:
+        raw_season = records[0].string
+        match = re.match(r'\d{4}/(\d{4})|\d{4}', raw_season)
+    
+        if match:
+            season = match.group(1) if match.group(1) else match.group(0)
+            return season[2:]
+        raise ValueError("Season Number not detected")        
+
+    def _create_record(self, season_data: bs4.element.tag) -> Tuple[str, SeasonRecord]:
         records = season_data.find_all("td")
-        record: SeasonRecord = {self._extract_data(record) for record in filter(self._has_title, records)}
-        return season, record
+
+        record: SeasonRecord = SeasonRecord(
+            season=self._extract_season(records),
+            player=self,
+            team=self._extract_team(records),
+            **dict(
+                self._extract_data(record)
+                for record in filter(self._has_title, records)
+            ),
+        )
+        return record["season"], record
 
     def statistics(self, season: str) -> SeasonRecord:
         return self._seasons[season]
 
+    def __str__(self) -> str:
+        return str(self._identifier)
+
 
 class Team:
-
-    def __init__(self, name: str, number: int):
+    def __init__(self, name: str, identifier: str):
         self._name = name
-        self._number = number
-   
-    def _extract_player_mapping(self, raw_player_data: List[str]) -> Tuple[str, int]:
+        self._identifier = identifier
+
+    def _extract_player_mapping(self, raw_player_data: List[str]) -> Tuple[str, str]:
         PLAYER_NAME_INDEX = 3
         LINK_INDEX = 1
         extraction = list(list(raw_player_data)[PLAYER_NAME_INDEX])[1]
@@ -69,55 +106,56 @@ class Team:
         match = re.search(pattern, extraction.get("href"))
 
         if not match:
-            raise ValueError(f"Could not find the player number for tag: {extraction}")
+            raise ValueError(
+                f"Could not find the player identifier for tag: {extraction}"
+            )
 
-        player_number = int(match.group(1))
+        player_number = str(match.group(1))
         return extraction.string, Player(extraction.string, player_number)
 
     @cache
-    def players(self, season: int) -> List[Player]:
-        url = f"{BASE_URL}/players?tm={self._number}"
+    def players(self, season: str) -> List[Player]:
+        url = f"{BASE_URL}/players?tm={self._identifier}"
         soup = get_bs4(url)
         players = list(soup.find_all("tr"))
-        return dict(self._extract_player_mapping(players[i]) for i in range(2, len(players)))
-
+        return dict(
+            self._extract_player_mapping(players[i]) for i in range(2, len(players))
+        )
 
 
 class SeasonScraper:
-
-    def __init__(self, season: int):
-        self._season: int = season
-        self._week: int = 1
-        self._league: int = 13		 
+    def __init__(self, season: str):
+        self._season: str = season
+        self._week: str = 1
+        self._league: str = 13
         self._teams: Dict[str, Team] = self._get_teams()
+
+    @property
+    def team_names(self) -> List[str]:
+        return list(self._teams.keys())
 
     @property
     def teams(self) -> Dict[str, Team]:
         return self._teams
 
-    def _extract_team_mapping(self, raw_team_data: List[str]) -> Tuple[str, int]:
+    def _extract_team_mapping(self, raw_team_data: List[str]) -> Tuple[str, str]:
         TEAM_NAME_INDEX = 3
         LINK_INDEX = 1
         extraction = list(list(raw_team_data)[TEAM_NAME_INDEX])[1]
-        pattern = r"/team/(\d+)/\S+/"
-        match = re.search(pattern, extraction.get("href"))
-
-        if not match:
-            raise ValueError(f"Could not find the team number for tag: {extraction}")
-
-        team_number = int(match.group(1))
-        return extraction.string, Team(extraction.string, team_number)
+        return extraction.string, Team(
+            extraction.string, extract_team_from_href(extraction.get("href"))
+        )
 
     def _get_teams(self) -> Dict[str, Team]:
         url = f"{BASE_URL}/teams?type=all&lg={LEAGUE_NUMBER}&r={self._season}00{self._week}&set=true"
-        soup = get_bs4(url)  
+        soup = get_bs4(url)
         teams = list(soup.find_all("tr"))
         return dict(self._extract_team_mapping(teams[i]) for i in range(2, len(teams)))
 
     @property
     def season_query(self) -> str:
-        return f"{season}00{self._week}" 
-    
+        return f"{season}00{self._week}"
+
     def create_url(self) -> str:
         return f"{BASE_URL}/?r={self.season_query}&set=true"
 
@@ -125,6 +163,6 @@ class SeasonScraper:
 if __name__ == "__main__":
     season_scraper = SeasonScraper(23)
     teams = list(season_scraper.teams.values())
-    players = list(teams[0].players(23).values())
+    players = list(teams[0].players("23").values())
     print(players)
     print(players[0].statistics("23"))
