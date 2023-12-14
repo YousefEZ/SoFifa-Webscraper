@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from time import sleep
-from functools import cached_property, cache
-from typing import TypedDict, Dict, Tuple, List
-import sys
+from functools import cache
+from typing import Any, TypedDict, Dict, Tuple, List, cast
 import re
+from typing_extensions import Required
 import urllib
 import urllib.request
+import urllib.error
 
 import bs4
-
+import bs4.element
 
 BASE_URL = "https://sofifa.com"
 LEAGUE_NUMBER = "13"  # EPL
@@ -86,6 +87,10 @@ def extract_team_from_href(href: str) -> str:
     return str(match.group(1))
 
 
+def generate_season_query(season: str, week: str) -> str:
+    return f"{season}00{week}"
+
+
 def retry_from_header(func):
     DEFAULT_RETRY = 15  # seconds
 
@@ -105,15 +110,15 @@ def retry_from_header(func):
 
 
 class SeasonRecord(TypedDict, total=False):
-    season: str
-    player: Player
-    team: Team
+    season: Required[str]
+    player: Required[Player]
+    team: Required[Team]
 
 
 class Player:
     def __init__(self, name: str, identifier: str):
-        self._name = name
-        self._identifier = identifier
+        self._name: str = name
+        self._identifier: str = identifier
 
     @property
     def name(self) -> str:
@@ -125,28 +130,35 @@ class Player:
         url = f"{BASE_URL}/player/{self._identifier}/live&set=true"
         soup = get_bs4(url)
         table = soup.find("table")
+        assert type(table) == bs4.element.Tag, f"Table is not a tag: {table}"
+
         if not table:
             # this is the case if the player is new, example: https://sofifa.com/player/268550/joshua-feeney/live
             return dict()
         seasons = list(table.find_all("tr"))
         return dict(self._create_record(seasons[i]) for i in range(2, len(seasons)))
 
-    def _has_title(self, column: bs4.element.tag) -> bool:
+    def _has_title(self, column: bs4.element.Tag) -> bool:
         return column.has_attr("title") and column.string is not None
 
-    def _extract_data(self, record: bs4.element.tag) -> Tuple[str, str]:
+    def _extract_data(self, record: bs4.element.Tag) -> Tuple[str, str]:
         # some data starts with "-" but is followed by weird characters, so normalising
-        return (
-            record.get("title").lower(),
-            "-" if record.string[0] == "-" else record.string,
-        )
 
-    def _extract_team(self, records: bs4.ResultSet) -> Team:
+        title = record.get("title")
+        assert type(title) == str, f"Title is not a string: {title}"
+
+        assert record.string, f"Record has no string: {record}"
+        value = record.string[0]
+        assert type(value) == str, f"Value is not a string: {value}"
+
+        return title.lower(), value
+
+    def _extract_team(self, records: bs4.ResultSet, season: str) -> Team:
         try:
             team_number = extract_team_from_href(records[1].find("a").get("href"))
         except ValueError:
             team_number = "-"  # some teams don't have identifiers, in this case filling it with "-"
-        return Team(records[1].get("title").strip(), team_number)
+        return Team(records[1].get("title").strip(), team_number, season, WEEK_NUMBER)
 
     def _extract_season(self, records: bs4.ResultSet) -> str:
         raw_season = records[0].string
@@ -157,13 +169,14 @@ class Player:
             return season[2:]
         raise ValueError("Season Number not detected")
 
-    def _create_record(self, season_data: bs4.element.tag) -> Tuple[str, SeasonRecord]:
+    def _create_record(self, season_data: bs4.element.Tag) -> Tuple[str, SeasonRecord]:
         records = season_data.find_all("td")
+        season: str = self._extract_season(records)
 
         record: SeasonRecord = SeasonRecord(
-            season=self._extract_season(records),
+            season=season,
             player=self,
-            team=self._extract_team(records),
+            team=self._extract_team(records, season),
             **dict(
                 self._extract_data(record)
                 for record in filter(self._has_title, records)
@@ -178,24 +191,34 @@ class Player:
     def __str__(self) -> str:
         return str(self._identifier)
 
-    def __eq__(self, other: Player) -> bool:
-        return other._identifier == self._identifier
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, Player):
+            return other._identifier == self._identifier
+        return super().__eq__(other)
 
     def __hash__(self) -> int:
         return hash(self._identifier)
 
 
 class Team:
-    def __init__(self, name: str, identifier: str):
+    def __init__(self, name: str, identifier: str, season: str, week: str):
         self._name = name
         self._identifier = identifier
+        self._season = season
+        self._week = week
 
-    def _extract_player_mapping(self, raw_player_data: List[str]) -> Tuple[str, Player]:
+    def _extract_player_mapping(
+        self, raw_player_data: bs4.element.Tag
+    ) -> Tuple[str, Player]:
         PLAYER_NAME_INDEX = 3
-        LINK_INDEX = 1
-        extraction = list(list(raw_player_data)[PLAYER_NAME_INDEX])[1]
+        raw_player = cast(bs4.element.Tag, list(raw_player_data)[PLAYER_NAME_INDEX])
+        extraction = cast(bs4.element.Tag, list(raw_player)[1])
+
+        player_url = extraction.get("href")
+        assert type(player_url) == str, f"Player number is not a string: {player_url}"
+
         pattern = r"/player/(\d+)/\S+/(\d+)"
-        match = re.search(pattern, extraction.get("href"))
+        match = re.search(pattern, player_url)
 
         if not match:
             raise ValueError(
@@ -203,12 +226,16 @@ class Team:
             )
 
         player_number = str(match.group(1))
-        return extraction.string, Player(extraction.string, player_number)
+
+        player_name = extraction.string
+        assert player_name, f"Player name is empty: {player_name}"
+
+        return player_name, Player(player_name, player_number)
 
     @cache
     @retry_from_header
-    def players(self, season: str) -> Dict[str, Player]:
-        url = f"{BASE_URL}/players?tm={self._identifier}"
+    def players(self) -> Dict[str, Player]:
+        url = f"{BASE_URL}/players?tm={self._identifier}&r={generate_season_query(self._season, self._week)}&set=true"
         soup = get_bs4(url)
         players = list(soup.find_all("tr"))
         return dict(
@@ -236,24 +263,29 @@ class Season:
     def teams(self) -> Dict[str, Team]:
         return self._teams
 
-    def _extract_team_mapping(self, raw_team_data: List[str]) -> Tuple[str, str]:
+    def _extract_team_mapping(self, raw_team_data: bs4.element.Tag) -> Tuple[str, Team]:
         TEAM_NAME_INDEX = 3
-        LINK_INDEX = 1
-        extraction = list(list(raw_team_data)[TEAM_NAME_INDEX])[1]
-        return extraction.string, Team(
-            extraction.string, extract_team_from_href(extraction.get("href"))
+        raw_team = cast(bs4.element.Tag, list(raw_team_data)[TEAM_NAME_INDEX])
+        raw_team_name: bs4.element.Tag = cast(bs4.element.Tag, list(raw_team)[1])
+
+        team_name = raw_team_name.string
+        assert team_name, f"Team name is empty: {team_name}"
+
+        team_number = raw_team_name.get("href")
+        assert type(team_number) == str, f"Team number is empty: {team_number}"
+
+        return team_name, Team(
+            team_name, extract_team_from_href(team_number), self._season, self._week
         )
 
     @retry_from_header
     def _get_teams(self) -> Dict[str, Team]:
         url = f"{BASE_URL}/teams?type=all&lg={LEAGUE_NUMBER}&r={self._season}00{self._week}&set=true"
         soup = get_bs4(url)
-        teams = list(soup.find_all("tr"))
+        teams: list[bs4.element.Tag] = list(soup.find_all("tr"))
         return dict(self._extract_team_mapping(teams[i]) for i in range(2, len(teams)))
 
-    @property
-    def season_query(self) -> str:
-        return f"{season}00{self._week}"
-
     def create_url(self) -> str:
-        return f"{BASE_URL}/?r={self.season_query}&set=true"
+        return (
+            f"{BASE_URL}/?r={generate_season_query(self._season, self._week)}&set=true"
+        )

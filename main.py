@@ -1,14 +1,17 @@
 import csv
-from typing import Set
+from typing import Concatenate, Callable, ParamSpec, TypeVar, Set, List
 
-from rich.console import Console
-from rich.progress import TaskID, TextColumn, BarColumn, SpinnerColumn, Progress, track
+from rich.progress import TextColumn, BarColumn, SpinnerColumn, Progress, track
 
 import fifascraper
 
 
-def progress_bar(func):
-    def decorator(*args, **kwargs):
+P = ParamSpec("P")
+T = TypeVar("T")
+
+
+def progress_bar(func: Callable[Concatenate[Progress, P], T]) -> Callable[P, T]:
+    def decorator(*args: P.args, **kwargs: P.kwargs) -> T:
         with Progress(
             SpinnerColumn(),
             TextColumn("{task.description}"),
@@ -21,7 +24,7 @@ def progress_bar(func):
     return decorator
 
 
-def write_players(players, writer) -> None:
+def write_players(players: List[Players], writer: csv.DictWriter) -> None:
     for player in players:
         try:
             record = player.season_record("23")
@@ -33,7 +36,7 @@ def write_players(players, writer) -> None:
 
 
 @progress_bar
-def scrape(progress):
+def scrape(progress: Progress) -> None:
     season = fifascraper.Season("23")
     with open("2023.csv", "w") as season_file:
         season_writer = csv.DictWriter(
@@ -46,7 +49,7 @@ def scrape(progress):
         )
 
         for team_name, team in season.teams.items():
-            write_players(team.players("23").values(), season_writer)
+            write_players(team.players().values(), season_writer)
             progress.update(teams_progress, advance=1, team=team_name)
             progress.refresh()
 
@@ -54,12 +57,12 @@ def scrape(progress):
 def set_of_players(season_number: str) -> Set[fifascraper.Player]:
     season = fifascraper.Season(season_number)
     players = set().union(
-        *map(lambda team: team.players("23").values(), season.teams.values())
+        *map(lambda team: team.players().values(), season.teams.values())
     )
     return players
 
 
-def scrape_players():
+def scrape_players() -> None:
     seasons = list(map(lambda num: num.zfill(2), map(str, range(7, 24))))
     players = set().union(*map(set_of_players, track(seasons, "Fetch Players")))
     with open("players.csv", "w") as season_file:
@@ -92,4 +95,4 @@ def scrape_players():
 
 
 if __name__ == "__main__":
-    players = scrape_players()
+    scrape_players()
